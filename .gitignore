@@ -1,0 +1,11 @@
+.venv/
+
+__pycache__/
+*.pyc
+*.pyo
+
+*.egg-info/
+
+data/raw/
+data/parquet/
+data/processed/
