@@ -13,6 +13,6 @@ print(f"Build time: {elapsed:.1f}s")
 
 # read back lazily using glob
 df = pl.scan_parquet(OUTPUT_DIR / "*.parquet")
-print(f"Columns: {df.columns}")
+print(f"Columns: {df.collect_schema().names()}")
 print(f"Shape: {df.select(pl.len()).collect().item()} rows")
 print(df.head(3).collect())
