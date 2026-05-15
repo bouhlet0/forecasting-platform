@@ -1,4 +1,3 @@
-# scripts/test_pipeline.py
 import polars as pl
 from src.features.pipeline import build_features_for_store
 from src.features.calendar import build_calendar_features
@@ -105,4 +104,50 @@ if extra:
     print(f"Warning: unexpected columns present: {extra}")
 
 print(f"\nFeature correlations with sales: {feature_corrs}")
+
+# lag correctness
+sample_ids = df["id"].unique().sample(5, seed=42)
+
+for sid in sample_ids:
+    sub = df.filter(pl.col("id") == sid).sort("date")
+
+    lag_check = (
+        sub.select([
+            pl.col("sales").shift(1).alias("expected_lag_1"),
+            pl.col("lag_1"),
+        ])
+        .drop_nulls()
+    )
+
+    assert (
+        (lag_check["expected_lag_1"] == lag_check["lag_1"]).all()
+    ), f"LAG_1 mismatch for {sid}"
+
+# rolling mean check
+expected = sub["sales"].shift(1).rolling_mean(7)
+actual = sub["roll_mean_7"]
+assert (expected - actual).abs().max() < 1e-6
+
+# uniqueness / alignment check
+dup_count = df.group_by(["id", "date"]).len().filter(pl.col("len") > 1).height
+assert dup_count == 0, f"Duplicate (id, date) rows found: {dup_count}"
+
+# time ordering check
+for sid in sample_ids:
+    sub = df.filter(pl.col("id") == sid)
+
+    dates = sub["date"].to_list()
+
+    assert dates == sorted(dates), f"Date ordering broken for {sid}"
+    
+# determinism check
+df2 = build_features_for_store("CA_1", calendar_features)
+
+assert df.shape == df2.shape, "Re-run shape mismatch"
+
+assert (
+    df.select(["sales", "lag_1", "roll_mean_7"])
+    .equals(df2.select(["sales", "lag_1", "roll_mean_7"]))
+), "Non-deterministic feature output detected"
+
 print("\nAll assertions passed.")
