@@ -30,3 +30,15 @@ print(check)
 manual_mean = series["sales"].head(7).mean()
 print(f"Manual mean of first 7 days: {manual_mean:.4f}")
 print(f"roll_mean_7 on day 8: {check['roll_mean_7'][7]:.4f}")
+
+print("\nTrend ratio null counts:")
+print(result.select(["trend_ratio_7_28", "trend_ratio_28_90"]).null_count())
+
+print("\nTrend ratio stats:")
+print(result.select(["trend_ratio_7_28", "trend_ratio_28_90"]).describe())
+
+print("\nTrend ratio sample (high volume item):")
+print(result.filter(pl.col("id") == "FOODS_3_090_CA_1_evaluation")
+    .select(["date", "sales", "roll_mean_7", "roll_mean_28", "roll_mean_90",
+             "trend_ratio_7_28", "trend_ratio_28_90"])
+    .tail(10))

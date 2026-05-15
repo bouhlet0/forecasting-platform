@@ -27,7 +27,6 @@ def add_rolling_features(lf: pl.LazyFrame) -> pl.LazyFrame:
             .alias(f"roll_sum_{window}"),
         ])
 
-    # rolling max only for 28
     rolling_exprs.append(
         pl.col("sales").shift(1).over("id")
         .rolling_max(window_size=28)
@@ -35,7 +34,6 @@ def add_rolling_features(lf: pl.LazyFrame) -> pl.LazyFrame:
         .alias("roll_max_28")
     )
 
-    # rolling median only for 28
     rolling_exprs.append(
         pl.col("sales").shift(1).over("id")
         .rolling_median(window_size=28)
@@ -43,4 +41,18 @@ def add_rolling_features(lf: pl.LazyFrame) -> pl.LazyFrame:
         .alias("roll_median_28")
     )
 
-    return lf.with_columns(rolling_exprs)
+    lf = lf.with_columns(rolling_exprs)
+
+    lf = lf.with_columns([
+        (
+            pl.col("roll_mean_7") /
+            pl.col("roll_mean_28").clip(lower_bound=1)
+        ).cast(pl.Float32).alias("trend_ratio_7_28"),
+
+        (
+            pl.col("roll_mean_28") /
+            pl.col("roll_mean_90").clip(lower_bound=1)
+        ).cast(pl.Float32).alias("trend_ratio_28_90"),
+    ])
+
+    return lf
