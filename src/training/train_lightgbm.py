@@ -45,16 +45,55 @@ def rmsse(
     return float(np.sqrt(np.mean((y_true - y_pred) ** 2) / naive_scale))
 
 
+def grouped_rmsse(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    y_train: np.ndarray,
+    train_ids: np.ndarray,
+    val_ids: np.ndarray,
+) -> float:
+
+    train_groups = {}
+    val_groups = {}
+
+    for idx, sid in enumerate(train_ids):
+        train_groups.setdefault(sid, []).append(idx)
+
+    for idx, sid in enumerate(val_ids):
+        val_groups.setdefault(sid, []).append(idx)
+
+    scores = []
+
+    for sid, val_idx in val_groups.items():
+
+        train_idx = train_groups.get(sid)
+
+        if train_idx is None or len(train_idx) < 2:
+            continue
+
+        train_series = y_train[train_idx]
+        val_series = y_true[val_idx]
+        pred_series = y_pred[val_idx]
+
+        scores.append(
+            rmsse(
+                val_series,
+                pred_series,
+                train_series,
+            )
+        )
+
+    return float(np.mean(scores))
+
+
 def train_fold(
     lf: pl.LazyFrame,
     fold,
     params: dict,
     sample_frac: float = 0.3,
-    seed = 42,
+    seed: int = 42,
 ) -> tuple[lgb.Booster, dict, np.ndarray]:
-    X_train, y_train, X_val, y_val, cat_col_indices = prepare_fold(
-        lf, fold, sample_frac=sample_frac, seed=seed
-    )
+    X_train, y_train, train_ids, X_val, y_val, val_ids, cat_col_indices = prepare_fold(lf, fold, sample_frac=sample_frac, seed=seed)
 
     dtrain = lgb.Dataset(
         X_train,
@@ -101,11 +140,11 @@ def train_fold(
     metrics = {
         "rmse": float(np.sqrt(np.mean((y_val - y_pred) ** 2))),
         "mae": float(np.mean(np.abs(y_val - y_pred))),
-        "rmsse": rmsse(y_val, y_pred, y_train),
+        "rmsse": grouped_rmsse(y_val, y_pred, y_train, train_ids, val_ids),
         "best_iteration": int(best_iter),
     }
 
-    del X_val, y_train
+    del X_val, y_train, y_val, train_ids, val_ids
     gc.collect()
 
     Path("models").mkdir(exist_ok=True)
@@ -114,10 +153,11 @@ def train_fold(
         num_iteration=best_iter,
     )
 
-    mlflow.lightgbm.log_model(
-        model,
-        name=f"model_fold_{fold.fold_idx}",
-    )
+    # Possibly temporary removal before optuna pass
+    # mlflow.lightgbm.log_model(
+    #     model,
+    #     name=f"model_fold_{fold.fold_idx}",
+    # )
 
     return model, metrics, y_pred
 
@@ -167,7 +207,6 @@ def run_cv(
                 f"fold{fold.fold_idx}_rmsse": metrics["rmsse"],
             }, step=fold.fold_idx)
 
-            # feature importance
             importance = model.feature_importance(importance_type="gain")
             feature_names = model.feature_name()
             top_features = sorted(
