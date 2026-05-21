@@ -9,3 +9,7 @@ __pycache__/
 data/raw/
 data/parquet/
 data/processed/
+
+/mlruns
+
+random_tests.py
