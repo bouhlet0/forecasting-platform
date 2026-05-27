@@ -8,14 +8,16 @@ from pathlib import Path
 
 from src.training.dataset import prepare_fold
 from src.training.splits import make_backtest_folds
+from src.training.metrics import compute_fold_weights_and_scales, calculate_sampled_wrmsse
+
 
 FEATURES_DIR = Path("data/processed/features")
 MLFLOW_EXPERIMENT = "m5-forecasting-lgbm"
 
 LGBM_PARAMS = {
     "objective": "tweedie",
-    "tweedie_variance_power": 1.1,
-    "metric": "rmse",
+    "tweedie_variance_power": 1.15,
+    "metric": "tweedie",
     "num_leaves": 255,
     "min_child_samples": 20,
     "learning_rate": 0.05,
@@ -28,72 +30,22 @@ LGBM_PARAMS = {
     "verbose": -1,
     "n_jobs": -1,
     "force_col_wise": True,
-    "max_bin": 127,
+    "max_bin": 127, 
     "seed": 42,
 }
 
-
-def rmsse(
-    y_true: np.ndarray,
-    y_pred: np.ndarray,
-    y_train: np.ndarray,
-) -> float:
-    y_train = np.asarray(y_train)
-    naive_scale = np.mean(np.diff(y_train) ** 2)
-    if naive_scale < 1e-8:
-        naive_scale = 1.0
-    return float(np.sqrt(np.mean((y_true - y_pred) ** 2) / naive_scale))
-
-
-def grouped_rmsse(
-    y_true: np.ndarray,
-    y_pred: np.ndarray,
-    y_train: np.ndarray,
-    train_ids: np.ndarray,
-    val_ids: np.ndarray,
-) -> float:
-
-    train_groups = {}
-    val_groups = {}
-
-    for idx, sid in enumerate(train_ids):
-        train_groups.setdefault(sid, []).append(idx)
-
-    for idx, sid in enumerate(val_ids):
-        val_groups.setdefault(sid, []).append(idx)
-
-    scores = []
-
-    for sid, val_idx in val_groups.items():
-
-        train_idx = train_groups.get(sid)
-
-        if train_idx is None or len(train_idx) < 2:
-            continue
-
-        train_series = y_train[train_idx]
-        val_series = y_true[val_idx]
-        pred_series = y_pred[val_idx]
-
-        scores.append(
-            rmsse(
-                val_series,
-                pred_series,
-                train_series,
-            )
-        )
-
-    return float(np.mean(scores))
-
-
 def train_fold(
     lf: pl.LazyFrame,
+    df_weight_ref: pl.DataFrame,
     fold,
     params: dict,
     sample_frac: float = 0.3,
     seed: int = 42,
 ) -> tuple[lgb.Booster, dict, np.ndarray]:
     X_train, y_train, train_ids, X_val, y_val, val_ids, cat_col_indices = prepare_fold(lf, fold, sample_frac=sample_frac, seed=seed)
+    
+    m5_reference = compute_fold_weights_and_scales(df_weight_ref, fold.train_end)
+
 
     dtrain = lgb.Dataset(
         X_train,
@@ -136,11 +88,14 @@ def train_fold(
 
     best_iter = model.best_iteration
     y_pred = np.clip(model.predict(X_val, num_iteration=best_iter), 0, None)
+    
+    POST_PROCESSING_MULTIPLIER = 0.975
+    y_pred_scaled = y_pred * POST_PROCESSING_MULTIPLIER
 
     metrics = {
-        "rmse": float(np.sqrt(np.mean((y_val - y_pred) ** 2))),
-        "mae": float(np.mean(np.abs(y_val - y_pred))),
-        "rmsse": grouped_rmsse(y_val, y_pred, y_train, train_ids, val_ids),
+        "rmse": float(np.sqrt(np.mean((y_val - y_pred_scaled) ** 2))),
+        "mae": float(np.mean(np.abs(y_val - y_pred_scaled))),
+        "wrmsse": calculate_sampled_wrmsse(y_val, y_pred_scaled, val_ids, m5_reference),
         "best_iteration": int(best_iter),
     }
 
@@ -159,7 +114,7 @@ def train_fold(
     #     name=f"model_fold_{fold.fold_idx}",
     # )
 
-    return model, metrics, y_pred
+    return model, metrics, y_pred_scaled
 
 
 def run_cv(
@@ -170,6 +125,9 @@ def run_cv(
     mlflow.set_experiment(experiment_name)
 
     lf = pl.scan_parquet(FEATURES_DIR / "*.parquet")
+    print("Collecting weight reference data...")
+    df_weight_ref = lf.select(["id", "date", "sales", "sell_price"]).collect()
+    print(f"Reference data shape: {df_weight_ref.shape}")
 
     dates = (
         lf.select("date")
@@ -192,19 +150,22 @@ def run_cv(
             print(f"Fold {fold.fold_idx}: {fold}")
             print(f"{'=' * 60}")
 
-            model, metrics, _ = train_fold(lf, fold, params, sample_frac)
+            model, metrics, _ = train_fold(
+                lf, df_weight_ref, fold, params,
+                sample_frac=sample_frac,
+            )
 
             print(
                 f"RMSE={metrics['rmse']:.4f} | "
                 f"MAE={metrics['mae']:.4f} | "
-                f"RMSSE={metrics['rmsse']:.4f} | "
+                f"WRMSSE={metrics['wrmsse']:.4f} | "
                 f"best_iter={metrics['best_iteration']}"
             )
 
             mlflow.log_metrics({
                 f"fold{fold.fold_idx}_rmse": metrics["rmse"],
                 f"fold{fold.fold_idx}_mae": metrics["mae"],
-                f"fold{fold.fold_idx}_rmsse": metrics["rmsse"],
+                f"fold{fold.fold_idx}_wrmsse": metrics["wrmsse"],
             }, step=fold.fold_idx)
 
             importance = model.feature_importance(importance_type="gain")
@@ -231,13 +192,13 @@ def run_cv(
         cv_rmse = float(np.mean([m["rmse"] for m in all_fold_metrics]))
         cv_rmse_std = float(np.std([m["rmse"] for m in all_fold_metrics]))
         cv_mae = float(np.mean([m["mae"] for m in all_fold_metrics]))
-        cv_rmsse = float(np.mean([m["rmsse"] for m in all_fold_metrics]))
+        cv_wrmsse = float(np.mean([m["wrmsse"] for m in all_fold_metrics]))
 
         mlflow.log_metrics({
             "cv_mean_rmse": cv_rmse,
             "cv_std_rmse": cv_rmse_std,
             "cv_mean_mae": cv_mae,
-            "cv_mean_rmsse": cv_rmsse,
+            "cv_mean_wrmsse": cv_wrmsse,
         })
 
         print(f"\n{'=' * 60}")
@@ -245,5 +206,5 @@ def run_cv(
         print(f"{'=' * 60}")
         print(f"RMSE  : {cv_rmse:.4f} +- {cv_rmse_std:.4f}")
         print(f"MAE   : {cv_mae:.4f}")
-        print(f"RMSSE : {cv_rmsse:.4f}")
+        print(f"WRMSSE : {cv_wrmsse:.4f}")
         print(f"{'=' * 60}")

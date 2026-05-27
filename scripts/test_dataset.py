@@ -1,37 +1,48 @@
 import polars as pl
+import numpy as np
 from src.training.splits import make_backtest_folds
-from src.training.dataset import prepare_fold, CAT_FEATURES, ID_COLS, TARGET
+from src.training.dataset import prepare_fold, CAT_FEATURES, ID_COLS, TARGET, get_feature_cols
 
 lf = pl.scan_parquet("data/processed/features/CA_1.parquet")
-dates = lf.select("date").collect()["date"].unique().to_list()
+dates = lf.select("date").collect()["date"].unique().sort().to_list()
 folds = make_backtest_folds(dates)
 
 fold = folds[0]
-X_train, y_train, X_val, y_val = prepare_fold(lf, fold)
+X_train, y_train, train_ids, X_val, y_val, val_ids, cat_col_indices = prepare_fold(lf, fold)
 
+print("--- Array Structural Metrics ---")
 print(f"X_train shape: {X_train.shape}")
 print(f"y_train shape: {y_train.shape}")
 print(f"X_val shape:   {X_val.shape}")
 print(f"y_val shape:   {y_val.shape}")
 
 print(f"\nFeature count: {X_train.shape[1]}")
-print(f"Categorical features: {CAT_FEATURES}")
+print(f"Categorical feature names: {CAT_FEATURES}")
+print(f"Categorical column matrix indices: {cat_col_indices}")
 
-# check categoricals are correctly typed
-for col in CAT_FEATURES:
-    assert X_train[col].dtype.name == "category", f"{col} is not category dtype in X_train"
-    assert X_val[col].dtype.name == "category", f"{col} is not category dtype in X_val"
-print(" Categorical dtypes correct")
+# Re-verify columns using the helper logic since X is now a NumPy array
+raw_columns = lf.collect_schema().names()
+feature_cols = get_feature_cols(raw_columns)
 
-# check no target leakage
-assert TARGET not in X_train.columns, "Target in X_train"
-assert TARGET not in X_val.columns, "Target in X_val"
-print(" No target leakage")
+# Check categorical index integrity
+print("\n--- Integrity Validations ---")
+for idx, name in zip(cat_col_indices, CAT_FEATURES):
+    assert feature_cols[idx] == name, f"Index mismatch! Index {idx} points to {feature_cols[idx]}, expected {name}"
+print(" Categorical physical index alignment verified.")
 
-# check no id columns in features
+# Check for target leakage
+assert TARGET not in feature_cols, f" Leakage Warning: Target column '{TARGET}' found inside feature columns!"
+print(" No target leakage found in feature list.")
+
+# Check for id columns in features
 for col in ID_COLS:
-    assert col not in X_train.columns, f"ID column {col} in X_train"
-print(" No ID columns in features")
+    assert col not in feature_cols, f" Structural Error: ID column '{col}' leaked into features!"
+print(" No ID tracking columns found in feature list.")
 
-print("\nSample X_train:")
-print(X_train.head(3))
+# Check that data types are fully numeric arrays (LightGBM ready)
+assert X_train.dtype == np.float32, "X_train must be float32 array"
+assert X_val.dtype == np.float32, "X_val must be float32 array"
+print(" Array memory dtypes correct (np.float32).")
+
+print("\n Matrix Sample (First row feature values):")
+print(X_train[0, :])

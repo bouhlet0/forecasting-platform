@@ -6,9 +6,7 @@ __pycache__/
 
 *.egg-info/
 
-data/raw/
-data/parquet/
-data/processed/
+/data
 
 /mlruns
 

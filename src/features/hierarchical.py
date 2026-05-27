@@ -1,16 +1,12 @@
 import polars as pl
 from pathlib import Path
 
-PROCESSED_DIR = Path("data/processed")
+PROCESSED_DIR = Path(__file__).resolve().parents[2] / "data" / "processed"
 
 
 def build_group_aggregates(
     output_path: Path = PROCESSED_DIR / "group_aggregates.parquet",
 ) -> None:
-    """
-    Pre-compute dept and cat daily sales totals across all stores.
-    Must be run once before per-store feature generation.
-    """
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     lf = pl.scan_parquet(PROCESSED_DIR / "long_by_store" / "*.parquet")
@@ -76,15 +72,25 @@ def add_hierarchical_features(lf: pl.LazyFrame) -> pl.LazyFrame:
         how="left",
     )
 
-    # relative position features
     lf = lf.with_columns([
-        (pl.col("sales") / pl.col("_dept_sales_raw").clip(lower_bound=1))
+        pl.col("sales").shift(1).over("id")
+        .alias("_sales_lag1_hier"),
+    ])
+
+    lf = lf.with_columns([
+        (
+            pl.col("_sales_lag1_hier") /
+            pl.col("dept_sales_lag1").clip(lower_bound=1)
+        )
         .cast(pl.Float32)
         .alias("item_share_dept"),
 
-        (pl.col("sales") / pl.col("_cat_sales_raw").clip(lower_bound=1))
+        (
+            pl.col("_sales_lag1_hier") /
+            pl.col("cat_sales_lag1").clip(lower_bound=1)
+        )
         .cast(pl.Float32)
         .alias("item_share_cat"),
     ])
 
-    return lf.drop(["_dept_sales_raw", "_cat_sales_raw"])
+    return lf.drop(["_dept_sales_raw", "_cat_sales_raw", "_sales_lag1_hier"])

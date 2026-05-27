@@ -13,6 +13,7 @@ TARGET = "sales"
 CAT_FEATURES = [
     "event_name_1", "event_type_1",
     "event_name_2", "event_type_2",
+    "snap_wday_interaction",
 ]
 
 
@@ -42,13 +43,21 @@ def prepare_fold(
 
     feature_cols = get_feature_cols(train.columns)
 
-    for col in CAT_FEATURES:
-        train = train.with_columns(
-            pl.col(col).cast(pl.Categorical).to_physical().cast(pl.Int32)
-        )
-        val = val.with_columns(
-            pl.col(col).cast(pl.Categorical).to_physical().cast(pl.Int32)
-        )
+    STR_CAT_FEATURES = ["event_name_1", "event_type_1", "event_name_2", "event_type_2"]
+
+    with pl.StringCache():
+        for col in STR_CAT_FEATURES:
+            train = train.with_columns(
+                pl.col(col).cast(pl.Categorical).to_physical().cast(pl.Int32)
+            )
+            val = val.with_columns(
+                pl.col(col).cast(pl.Categorical).to_physical().cast(pl.Int32)
+            )
+            
+    # snap_wday_interaction is already a safe Int8; we just ensure it is Int32 for consistency
+    if "snap_wday_interaction" in train.columns:
+        train = train.with_columns(pl.col("snap_wday_interaction").cast(pl.Int32))
+        val = val.with_columns(pl.col("snap_wday_interaction").cast(pl.Int32))
 
     train_ids = train.select("id").to_numpy().ravel()
     val_ids = val.select("id").to_numpy().ravel()

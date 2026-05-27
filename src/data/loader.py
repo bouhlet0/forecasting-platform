@@ -2,8 +2,8 @@ from pathlib import Path
 import polars as pl
 import gc
 
-PARQUET_DIR = Path("data/parquet")
-PROCESSED_DIR = Path("data/processed")
+PARQUET_DIR = Path(__file__).resolve().parents[2] / "data" / "parquet"
+PROCESSED_DIR = Path(__file__).resolve().parents[2] / "data" / "processed"
 
 
 def build_long_chunked(
