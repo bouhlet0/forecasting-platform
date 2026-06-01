@@ -1,6 +1,5 @@
 import polars as pl
 
-
 ROLLING_WINDOWS = [7, 28, 90]
 
 
@@ -40,6 +39,25 @@ def add_rolling_features(lf: pl.LazyFrame) -> pl.LazyFrame:
         .over("id")
         .alias("roll_median_28")
     )
+    
+    shifted_anchor = pl.col("sales").shift(28).over("id")
+
+    rolling_exprs.extend([
+        shifted_anchor
+        .rolling_mean(window_size=7)
+        .over("id")
+        .alias("roll_mean_7_lag_28"),
+
+        shifted_anchor
+        .rolling_mean(window_size=28)
+        .over("id")
+        .alias("roll_mean_28_lag_28"),
+
+        shifted_anchor
+        .rolling_std(window_size=28)
+        .over("id")
+        .alias("roll_std_28_lag_28"),
+    ])
 
     lf = lf.with_columns(rolling_exprs)
 

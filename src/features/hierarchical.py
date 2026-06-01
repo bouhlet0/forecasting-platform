@@ -21,6 +21,12 @@ def build_group_aggregates(
             .alias("dept_sales_lag1"),
 
             pl.col("dept_sales").shift(1)
+            .rolling_mean(window_size=7)
+            .over(["store_id", "dept_id"])
+            .cast(pl.Float32)
+            .alias("dept_sales_roll_7"),
+
+            pl.col("dept_sales").shift(1)
             .rolling_mean(window_size=28)
             .over(["store_id", "dept_id"])
             .cast(pl.Float32)
@@ -39,6 +45,12 @@ def build_group_aggregates(
             .alias("cat_sales_lag1"),
 
             pl.col("cat_sales").shift(1)
+            .rolling_mean(window_size=7)
+            .over(["store_id", "cat_id"])
+            .cast(pl.Float32)
+            .alias("cat_sales_roll_7"),
+
+            pl.col("cat_sales").shift(1)
             .rolling_mean(window_size=28)
             .over(["store_id", "cat_id"])
             .cast(pl.Float32)
@@ -53,8 +65,8 @@ def build_group_aggregates(
         how="left",
     ).select([
         "store_id", "dept_id", "cat_id", "date",
-        "_dept_sales_raw", "dept_sales_lag1", "dept_sales_roll_28",
-        "_cat_sales_raw", "cat_sales_lag1", "cat_sales_roll_28",
+        "_dept_sales_raw", "dept_sales_lag1", "dept_sales_roll_7", "dept_sales_roll_28",
+        "_cat_sales_raw", "cat_sales_lag1", "cat_sales_roll_7", "cat_sales_roll_28",
     ])
 
     result.sink_parquet(output_path)

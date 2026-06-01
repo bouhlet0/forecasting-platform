@@ -1,8 +1,6 @@
 import polars as pl
 
-
 def add_price_features(lf: pl.LazyFrame) -> pl.LazyFrame:
-    
     lf = lf.with_columns([
         pl.col("sell_price").is_not_null().cast(pl.Int8).alias("has_price"),
     ])
@@ -13,28 +11,39 @@ def add_price_features(lf: pl.LazyFrame) -> pl.LazyFrame:
         .over("id")
         .alias("sell_price"),
     ])
+    
+    price_roll_mean_90 = pl.col("sell_price").rolling_mean(window_size=90).over("id")
 
     lf = lf.with_columns([
         # week-over-week price change as ratio
         (
             pl.col("sell_price") / pl.col("sell_price").shift(7).over("id") - 1
-        ).alias("price_change_w"),
+        ).cast(pl.Float32).alias("price_change_w"),
 
         # price relative to item's rolling 90-day mean (promotion signal)
         (
-            pl.col("sell_price") / pl.col("sell_price").rolling_mean(window_size=90).over("id")
-        ).alias("price_rel_mean_90"),
+            pl.col("sell_price") / price_roll_mean_90
+        ).cast(pl.Float32).alias("price_rel_mean_90"),
 
-        # price volatility: std of price over last 30 days (much faster to run approximation)
+        # price volatility: std of price over last 30 days
         pl.col("sell_price")
         .rolling_std(window_size=30)
         .over("id")
+        .cast(pl.Float32)
         .alias("price_std_30"),
 
         # on promotion flag: price more than 5% below 90-day rolling mean
         (
-            pl.col("sell_price") < (pl.col("sell_price").rolling_mean(window_size=90).over("id") * 0.95)
+            pl.col("sell_price") < (price_roll_mean_90 * 0.95)
         ).cast(pl.Int8).alias("is_on_promotion"),
+        
+        (
+            pl.col("sell_price") / pl.col("sell_price").rolling_mean(window_size=7).over("id")
+        ).cast(pl.Float32).alias("price_momentum_w"),
+
+        (
+            pl.col("sell_price") / pl.col("sell_price").mean().over(["item_id", "date"])
+        ).cast(pl.Float32).alias("price_vs_market_avg"),
     ])
 
     return lf
