@@ -4,6 +4,8 @@ import mlflow
 import mlflow.lightgbm
 import numpy as np
 import polars as pl
+import scipy.optimize as opt
+import json
 from pathlib import Path
 
 from src.training.dataset import prepare_fold
@@ -17,22 +19,89 @@ MLFLOW_EXPERIMENT = "m5-forecasting-lgbm"
 LGBM_PARAMS = {
     "objective": "tweedie",
     "tweedie_variance_power": 1.15,
-    "metric": "tweedie",
+    "metric": "rmse",
     "num_leaves": 255,
-    "min_child_samples": 20,
-    "learning_rate": 0.05,
-    "feature_fraction": 0.8,
-    "bagging_fraction": 0.8,
+    "min_child_samples": 255,
+    "learning_rate": 0.025,
+    "feature_fraction": 0.5,
+    "bagging_fraction": 0.5,
     "bagging_freq": 1,
-    "lambda_l2": 0.1,
-    "n_estimators": 1500,
-    "early_stopping_rounds": 50,
+    # "lambda_l2": 0.1,
+    "n_estimators": 2000,
+    "early_stopping_rounds": 150,
     "verbose": -1,
     "n_jobs": -1,
     "force_col_wise": True,
-    "max_bin": 127, 
+    "boost_from_average": False,
+    "max_bin": 100, 
     "seed": 42,
 }
+
+def optimize_department_multipliers(
+    y_true: np.ndarray,
+    y_pred_base: np.ndarray,
+    val_ids: np.ndarray,
+    m5_reference: dict,
+    lf: pl.LazyFrame,
+    fold,
+) -> tuple[np.ndarray, dict]:
+    print("\nOptimizing multipliers by department on validation predictions.")
+    
+    val_depts = (
+        lf.filter(
+            (pl.col("date") >= fold.val_start) & 
+            (pl.col("date") <= fold.val_end)
+        )
+        .select("dept_id")
+        .collect()
+        ["dept_id"]
+        .to_numpy()
+    )
+    
+    unique_depts = np.unique(val_depts)
+
+    def evaluate_multipliers(multipliers_vector):
+        mult_dict = dict(zip(unique_depts, multipliers_vector))
+        row_multipliers = np.array([mult_dict[d] for d in val_depts])
+        scaled_preds = y_pred_base * row_multipliers
+        return calculate_sampled_wrmsse(y_true, scaled_preds, val_ids, m5_reference)
+
+    # Use 0.975 as the starting anchor point for all departments
+    initial_guess = [0.975] * len(unique_depts)
+    bounds = [(0.85, 1.15)] * len(unique_depts)
+
+    res = opt.minimize(evaluate_multipliers, initial_guess, bounds=bounds, method="Powell")
+    
+    optimal_mult_dict = dict(zip(unique_depts, res.x))
+    final_row_multipliers = np.array([optimal_mult_dict[d] for d in val_depts])
+    
+    y_pred_final = y_pred_base * final_row_multipliers
+
+    print("Optimal per-dept multipliers for this run ")
+    for d, m in optimal_mult_dict.items():
+        print(f"  {d:12} -> {m:.4f}")
+        
+    return y_pred_final, optimal_mult_dict
+
+def get_safe_multiplier(sid, m5_ref, alpha=0.5):
+    if sid not in m5_ref:
+        return 1.0
+
+    scale = m5_ref[sid]["scale"]
+    weight = m5_ref[sid]["weight"]
+
+    if scale <= 0:
+        return 1.0
+
+    # Soft stabilization floor to handle low-volume items smoothly
+    safe_scale = max(scale, 1e-5)
+    ratio = weight / safe_scale
+
+    # Compute raw importance curve
+    multiplier = ratio ** alpha
+
+    # Soft clipping here just to prevent catastrophic infinity errors early on
+    return float(np.clip(multiplier, 1e-5, 50.0))
 
 def train_fold(
     lf: pl.LazyFrame,
@@ -41,22 +110,48 @@ def train_fold(
     params: dict,
     sample_frac: float = 0.3,
     seed: int = 42,
-) -> tuple[lgb.Booster, dict, np.ndarray]:
-    X_train, y_train, train_ids, X_val, y_val, val_ids, cat_col_indices = prepare_fold(lf, fold, sample_frac=sample_frac, seed=seed)
+) -> tuple[list[lgb.Booster], dict, np.ndarray]:
+    
+    X_train, y_train, train_ids, X_val, y_val, val_ids, cat_col_indices = prepare_fold(
+        lf, fold, sample_frac=sample_frac, seed=seed
+    )
     
     m5_reference = compute_fold_weights_and_scales(df_weight_ref, fold.train_end)
 
+    print("Generating WRMSSE Custom Sample Weights for Training.")
+    raw_train_multipliers = np.array([
+        get_safe_multiplier(sid, m5_reference, alpha=0.5) for sid in train_ids
+    ], dtype=np.float32)
+
+    train_median = np.median(raw_train_multipliers)
+
+    normalized_weights = raw_train_multipliers / max(train_median, 1e-8)
+
+    train_weights = np.clip(normalized_weights, 0.2, 5.0)
+
+    print("\n" + "="*40)
+    print(" TRAINING WEIGHT DIAGNOSTICS (MEDIAN SCALED)")
+    print("="*40)
+    print(f"  Min Weight:  {train_weights.min():.4f}")
+    print(f"  Max Weight:  {train_weights.max():.4f}")
+    print(f"  Mean Weight: {train_weights.mean():.4f}")
+    print(f"  Median:      {np.median(train_weights):.4f}")
+    print(f"  95th Pctl:   {np.percentile(train_weights, 95):.4f}")
+    print(f"  99th Pctl:   {np.percentile(train_weights, 99):.4f}")
+    print("="*40 + "\n")
+    print("="*40 + "\n")
 
     dtrain = lgb.Dataset(
         X_train,
-        label=y_train,
+        label=y_train,         
+        weight=train_weights,  
         categorical_feature=cat_col_indices,
         free_raw_data=True,
     )
 
     dval = lgb.Dataset(
         X_val,
-        label=y_val,
+        label=y_val,           
         reference=dtrain,
         categorical_feature=cat_col_indices,
         free_raw_data=True,
@@ -72,49 +167,71 @@ def train_fold(
 
     fit_params = {
         k: v for k, v in params.items()
-        if k not in ("early_stopping_rounds", "n_estimators")
+        if k not in ("early_stopping_rounds", "n_estimators", "seed")
     }
 
-    model = lgb.train(
-        fit_params,
-        dtrain,
-        num_boost_round=params["n_estimators"],
-        valid_sets=[dval],
-        callbacks=callbacks,
-    )
+    seeds = [42, 100]
+    trained_seeds_models = []
+    raw_val_preds_accumulated = np.zeros_like(y_val, dtype=np.float32)
+
+    for current_seed in seeds:
+        print(f"--- Training Seed {current_seed} ---")
+        current_params = fit_params.copy()
+        current_params["seed"] = current_seed
+        
+        model = lgb.train(
+            current_params,
+            dtrain,
+            num_boost_round=params["n_estimators"],
+            valid_sets=[dval],
+            callbacks=callbacks,
+        )
+        trained_seeds_models.append(model)
+        
+        raw_val_preds_accumulated += model.predict(X_val, num_iteration=model.best_iteration)
+        
+        del model
+        gc.collect()
+
+    avg_raw_preds = raw_val_preds_accumulated / len(seeds)
 
     del dtrain, dval
     gc.collect()
 
-    best_iter = model.best_iteration
-    y_pred = np.clip(model.predict(X_val, num_iteration=best_iter), 0, None)
+    y_pred_base = np.clip(avg_raw_preds, 0, None)
     
-    POST_PROCESSING_MULTIPLIER = 0.975
-    y_pred_scaled = y_pred * POST_PROCESSING_MULTIPLIER
+    y_pred_final, optimal_mult_dict = optimize_department_multipliers(
+        y_true=y_val,
+        y_pred_base=y_pred_base,
+        val_ids=val_ids,
+        m5_reference=m5_reference,
+        lf=lf,
+        fold=fold
+    )
 
     metrics = {
-        "rmse": float(np.sqrt(np.mean((y_val - y_pred_scaled) ** 2))),
-        "mae": float(np.mean(np.abs(y_val - y_pred_scaled))),
-        "wrmsse": calculate_sampled_wrmsse(y_val, y_pred_scaled, val_ids, m5_reference),
-        "best_iteration": int(best_iter),
+        "rmse": float(np.sqrt(np.mean((y_val - y_pred_final) ** 2))),
+        "mae": float(np.mean(np.abs(y_val - y_pred_final))),
+        "wrmsse": calculate_sampled_wrmsse(y_val, y_pred_final, val_ids, m5_reference),
+        "best_iteration": int(trained_seeds_models[0].best_iteration),
     }
+
+    for d, m in optimal_mult_dict.items():
+        mlflow.log_metric(f"fold{fold.fold_idx}_multiplier_{d}", float(m))
 
     del X_val, y_train, y_val, train_ids, val_ids
     gc.collect()
 
     Path("models").mkdir(exist_ok=True)
-    model.save_model(
+    trained_seeds_models[0].save_model(
         f"models/lgbm_fold_{fold.fold_idx}.txt",
-        num_iteration=best_iter,
+        num_iteration=trained_seeds_models[0].best_iteration,
     )
 
-    # Possibly temporary removal before optuna pass
-    # mlflow.lightgbm.log_model(
-    #     model,
-    #     name=f"model_fold_{fold.fold_idx}",
-    # )
+    with open(f"models/multipliers_fold_{fold.fold_idx}.json", "w") as f:
+        json.dump(optimal_mult_dict, f)
 
-    return model, metrics, y_pred_scaled
+    return trained_seeds_models, metrics, y_pred_final
 
 
 def run_cv(
@@ -168,8 +285,8 @@ def run_cv(
                 f"fold{fold.fold_idx}_wrmsse": metrics["wrmsse"],
             }, step=fold.fold_idx)
 
-            importance = model.feature_importance(importance_type="gain")
-            feature_names = model.feature_name()
+            importance = model[0].feature_importance(importance_type="gain")
+            feature_names = model[0].feature_name()
             top_features = sorted(
                 zip(feature_names, importance),
                 key=lambda x: x[1],
